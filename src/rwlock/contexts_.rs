@@ -170,6 +170,11 @@ where
         self.cx_stat_.try_downgrade_exclusive_to_readonly()
     }
 
+    #[inline]
+    pub fn try_downgrade_exclusive_to_upgradable(&self) -> bool {
+        self.cx_stat_.try_downgrade_exclusive_to_upgradable()
+    }
+
     #[allow(dead_code)]
     #[inline]
     pub fn reader_count(&self) -> usize {
@@ -390,6 +395,14 @@ impl<O: TrCmpxchOrderings> CtxState<O> {
         self.try_spin_compare_exchange_weak(
                 CtxStConf::expect_ctx_type_exclusive,
                 CtxStConf::desire_ctx_type_readonly)
+            .is_succ()
+    }
+
+    #[inline]
+    pub fn try_downgrade_exclusive_to_upgradable(&self) -> bool {
+        self.try_spin_compare_exchange_weak(
+                CtxStConf::expect_ctx_type_exclusive,
+                CtxStConf::desire_ctx_type_upgradable)
             .is_succ()
     }
 

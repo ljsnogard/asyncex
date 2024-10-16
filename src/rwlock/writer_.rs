@@ -20,6 +20,8 @@ use abs_sync::{
 };
 use mm_ptr::x_deps::atomic_sync::x_deps::{abs_sync, atomex};
 
+use crate::rwlock::contexts_::CtxType;
+
 use super::{
     contexts_::Message,
     impl_::*,
@@ -55,7 +57,7 @@ where
         }
     }
 
-    pub fn acquire_pinned_(&mut self) -> Pin<&mut Acquire<'a, T, O>> {
+    fn acquire_pinned_(&mut self) -> Pin<&mut Acquire<'a, T, O>> {
         match self {
             WGuardCtx::Acq(a) => a.as_mut(),
             WGuardCtx::Upg(u) => unsafe {
@@ -65,7 +67,7 @@ where
         }
     }
 
-    pub fn upgrade_pinned_(
+    fn upgrade_pinned_(
         &mut self,
     ) -> Option<Pin<&mut Upgrade<'a, 'g, T, O>>> {
         if let WGuardCtx::Upg(u) = self {
@@ -128,20 +130,79 @@ where
     /// ```
     /// # futures_lite::future::block_on(async {
     /// use atomex::StrictOrderings;
-    /// use asynchronex::{rwlock::RwLock, x_deps::atomex};
+    /// use asyncex::{
+    ///     rwlock::RwLock,
+    ///     x_deps::{atomex, pin_utils},
+    /// };
+    /// use pin_utils::pin_mut;
     ///
-    /// let lock = RwLock::new_with(1, StrictOrderings::default);
-    /// let mut writer = lock.write_async().await;
+    /// let lock = RwLock::<usize, StrictOrderings>::new(1);
+    /// let acq1 = lock.acquire();
+    /// pin_mut!(acq1);
+    /// let mut writer = acq1.as_mut().write_async().await;
     /// *writer += 1;
     ///
-    /// assert!(lock.try_read().is_none());
+    /// let acq2 = lock.acquire();
+    /// pin_mut!(acq2);
+    /// assert!(acq2.as_mut().try_read().is_none());
     /// let reader = writer.downgrade();
     /// assert_eq!(*reader, 2);
-    /// assert!(lock.try_read().is_some());
+    /// assert!(acq2.as_mut().try_read().is_some());
     /// # })
     /// ```
     pub fn downgrade(self) -> ReaderGuard<'a, 'g, T, O> {
-        todo!()
+        let mut m = ManuallyDrop::new(self);
+        return match &mut m.0 {
+            WGuardCtx::Acq(acq) => from_acq_(acq),
+            WGuardCtx::Upg(upg) => from_upg_(upg),
+        };
+
+        fn from_acq_<'acq, 'guard, TRes, TOrd>(
+            acq: &mut Pin<&mut Acquire<'acq, TRes, TOrd>>,
+        ) -> ReaderGuard<'acq, 'guard, TRes, TOrd>
+        where
+            TRes: ?Sized,
+            TOrd: TrCmpxchOrderings,
+        {
+            let mut acq_ptr: NonNull<Acquire<'acq, TRes, TOrd>> = unsafe {
+                let ptr = acq.as_mut().get_unchecked_mut();
+                NonNull::new_unchecked(ptr)
+            };
+            let opt_g = unsafe {
+                let acq = Pin::new_unchecked(acq_ptr.as_mut());
+                acq.try_read()
+            };
+            if let Option::Some(g) = opt_g {
+                return g;
+            } else {
+                let acq = unsafe { Pin::new_unchecked(acq_ptr.as_mut()) };
+                acq.downgrade_writer_to_reader_();
+            }
+            ReaderGuard::new(unsafe {
+                Pin::new_unchecked(acq_ptr.as_mut())
+            })
+        }
+
+        fn from_upg_<'acq, 'guard, TRes, TOrd>(
+            upg: &mut NonNull<Upgrade<'acq, 'guard, TRes, TOrd>>
+        ) -> ReaderGuard<'acq, 'guard, TRes, TOrd>
+        where
+            TRes: ?Sized,
+            TOrd: TrCmpxchOrderings,
+        {
+            let mut acquire = unsafe {
+                let pinned = Pin::new_unchecked(upg.as_mut());
+                pinned.acquire_pinned_()
+            };
+            debug_assert!({
+                let slot = acquire.slot_();
+                let ctx_type = slot.data().context_type();
+                slot.is_element_of(acquire.rwlock().queue())
+                    && matches!(ctx_type, CtxType::ReadOnly)
+            });
+            acquire.as_mut().downgrade_writer_to_reader_();
+            ReaderGuard::new(acquire)
+        }
     }
 
     /// Downgrades into an upgradable reader guard.
@@ -151,16 +212,20 @@ where
     /// ```
     /// # futures_lite::future::block_on(async {
     /// use atomex::StrictOrderings;
-    /// use asynchronex::{rwlock::RwLock, x_deps::atomex};
+    /// use asyncex::{
+    ///     rwlock::RwLock,
+    ///     x_deps::{atomex, pin_utils},
+    /// };
+    /// use pin_utils::pin_mut;
     ///
-    /// let lock = RwLock::new_with(1, StrictOrderings::default);
-    /// let mut acq = lock.acquire();
-    /// let acq_pinned = acq.pinned();
-    /// let mut writer = acq_pinned.write_async().await;
+    /// let lock = RwLock::<usize, StrictOrderings>::new(1);
+    /// let acq = lock.acquire();
+    /// pin_mut!(acq);
+    /// let mut writer = acq.write_async().await;
     /// *writer += 1;
     /// 
     /// let mut acq2 = lock.acquire();
-    /// let mut acq2 = acq2.pinned();
+    /// pin_mut!(acq2);
     /// assert!(acq2.as_mut().try_read().is_none());
     /// 
     /// let reader = writer.downgrade_to_upgradable();
@@ -169,11 +234,64 @@ where
     /// assert!(acq2.as_mut().try_write().is_none());
     /// assert!(acq2.as_mut().try_read().is_some());
     ///
-    /// assert!(reader.try_upgrade().is_ok())
+    /// let upgrade = reader.upgrade();
+    /// pin_mut!(upgrade);
+    /// assert!(upgrade.as_mut().try_upgrade().is_some())
     /// # })
     /// ```
     pub fn downgrade_to_upgradable(self) -> UpgradableReaderGuard<'a, 'g, T, O> {
-        todo!()
+        let mut m = ManuallyDrop::new(self);
+        return match &mut m.0 {
+            WGuardCtx::Acq(acq) => from_acq_(acq),
+            WGuardCtx::Upg(upg) => from_upg_(upg),
+        };
+
+        fn from_acq_<'acq, 'guard, TRes, TOrd>(
+            acq: &mut Pin<&mut Acquire<'acq, TRes, TOrd>>,
+        ) -> UpgradableReaderGuard<'acq, 'guard, TRes, TOrd>
+        where
+            TRes: ?Sized,
+            TOrd: TrCmpxchOrderings,
+        {
+            let mut acq_ptr: NonNull<Acquire<'acq, TRes, TOrd>> = unsafe {
+                let ptr = acq.as_mut().get_unchecked_mut();
+                NonNull::new_unchecked(ptr)
+            };
+            let opt_g = unsafe {
+                let acq = Pin::new_unchecked(acq_ptr.as_mut());
+                acq.try_upgradable_read()
+            };
+            if let Option::Some(g) = opt_g {
+                return g;
+            } else {
+                let acq = unsafe { Pin::new_unchecked(acq_ptr.as_mut()) };
+                acq.downgrade_writer_to_upgradable_();
+            }
+            UpgradableReaderGuard::new(unsafe {
+                Pin::new_unchecked(acq_ptr.as_mut())
+            })
+        }
+
+        fn from_upg_<'acq, 'guard, TRes, TOrd>(
+            upg: &mut NonNull<Upgrade<'acq, 'guard, TRes, TOrd>>
+        ) -> UpgradableReaderGuard<'acq, 'guard, TRes, TOrd>
+        where
+            TRes: ?Sized,
+            TOrd: TrCmpxchOrderings,
+        {
+            let mut acquire = unsafe {
+                let pinned = Pin::new_unchecked(upg.as_mut());
+                pinned.acquire_pinned_()
+            };
+            debug_assert!({
+                let slot = acquire.slot_();
+                let ctx_type = slot.data().context_type();
+                slot.is_element_of(acquire.rwlock().queue())
+                    && matches!(ctx_type, CtxType::Upgradable)
+            });
+            acquire.as_mut().downgrade_writer_to_upgradable_();
+            UpgradableReaderGuard::new(acquire)
+        }
     }
 
     #[inline]

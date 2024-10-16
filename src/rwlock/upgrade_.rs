@@ -170,7 +170,7 @@ where
     /// # futures_lite::future::block_on(async {
     /// use pin_utils::pin_mut;
     /// use atomex::StrictOrderings;
-    /// use asynchronex::{rwlock::RwLock, x_deps::{atomex, pin_utils}};
+    /// use asyncex::{rwlock::RwLock, x_deps::{atomex, pin_utils}};
     ///
     /// let rwlock = RwLock::<usize, StrictOrderings>::new(42);
     /// let acq1 = rwlock.acquire();
@@ -586,11 +586,10 @@ where
                 r.is_succ(),
                 "[rwlock::UpgradeFuture::upgrade_async_] try_set_ctx_upgraded",
             );
-            let acquire = unsafe {
-                // Use unsafe here to get a `WriterGuard` with proper lifetime
-                Pin::new_unchecked(acquire.as_mut())
+            let upgrade_pin = unsafe {
+                Pin::new_unchecked(upgrade.as_mut())
             };
-            Option::Some(WriterGuard::from_acquire(acquire))
+            Option::Some(WriterGuard::from_upgrade(upgrade_pin))
         } else {
             Option::None
         }

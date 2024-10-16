@@ -2,7 +2,7 @@
     cell::UnsafeCell,
     marker::PhantomData,
     mem::ManuallyDrop,
-    ops::{Deref, Try},
+    ops::{Deref, DerefMut, Try},
     pin::Pin,
     ptr::{self, NonNull},
 };
@@ -49,7 +49,7 @@ where
     ///
     /// ```
     /// use atomex::StrictOrderings;
-    /// use asynchronex::{rwlock::RwLock, x_deps::atomex};
+    /// use asyncex::{rwlock::RwLock, x_deps::atomex};
     ///
     /// let lock = RwLock::<usize, StrictOrderings>::new(42);
     /// assert!(!lock.is_acquired())
@@ -62,35 +62,16 @@ where
         }
     }
 
-    /// Creates a new reader-writer lock with specified orderings
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use atomex::StrictOrderings;
-    /// use asynchronex::{rwlock::RwLock, x_deps::atomex};
-    ///
-    /// let lock = RwLock::new_with(42, StrictOrderings::default);
-    /// assert!(!lock.is_acquired())
-    /// ```
-    pub fn new_with(
-        data: T,
-        orderings: impl FnOnce() -> O,
-    ) -> RwLock<T, O> {
-        let _ = orderings;
-        Self::new(data)
-    }
-
     /// Unwraps the lock and returns the inner value.
     ///
     /// # Examples
     ///
     /// ```
     /// use atomex::StrictOrderings;
-    /// use asynchronex::{rwlock::RwLock, x_deps::atomex};
+    /// use asyncex::{rwlock::RwLock, x_deps::atomex};
     ///
     /// const ANSWER: usize = 5;
-    /// let lock = RwLock::new_with(ANSWER, StrictOrderings::default);
+    /// let lock = RwLock::<usize, StrictOrderings>::new(ANSWER);
     /// assert_eq!(lock.into_inner(), 5);
     /// ```
     #[must_use]
@@ -114,13 +95,15 @@ where
     /// ```
     /// use pin_utils::pin_mut;
     /// use atomex::StrictOrderings;
-    /// use asynchronex::{rwlock::RwLock, x_deps::{atomex, pin_utils}};
+    /// use asyncex::{rwlock::RwLock, x_deps::{atomex, pin_utils}};
     ///
-    /// let rwlock = RwLock::new_with((), StrictOrderings::default);
+    /// let rwlock = RwLock::<(), StrictOrderings>::new(());
     /// assert!(!rwlock.is_acquired());
+    ///
     /// let acq = rwlock.acquire();
     /// pin_mut!(acq);
     /// assert!(!rwlock.is_acquired());
+    ///
     /// let reader = acq.try_read().unwrap();
     /// assert!(rwlock.is_acquired());
     /// drop(reader);
@@ -133,7 +116,7 @@ where
     /// Return the number of readers that currently hold the lock (including
     /// upgradable readers).
     ///
-    /// ## Safety
+    /// # Safety
     ///
     /// This function provides no synchronization guarantees and so its result
     /// should be considered 'out of date' the instant it is called. Do not use
@@ -159,9 +142,7 @@ where
         &self.wake_list_
     }
 
-    fn wake_next_(
-        mut list: Pin<&mut WakeList<O>>,
-    ) {
+    fn wake_next_(mut list: Pin<&mut WakeList<O>>) {
         let mut curr = list.as_mut().head_mut();
         loop {
             let Option::Some(ctx) = curr.current_pinned() else {
@@ -251,6 +232,8 @@ where
     O: TrCmpxchOrderings,
 {}
 
+/// The isolated context for concurrent attempts of acquiring the rwlock.
+///
 /// 提供一个异步上下文的栈上存储空间。每一个 `Acquire` 实例能同时容纳不多于一个异步请求，即使
 /// 是可并发的读锁请求，也必须使用不同的实例。
 pub struct Acquire<'a, T, O>
@@ -287,12 +270,14 @@ where
         unsafe { self.get_unchecked_mut().try_read_() }
     }
 
+    #[inline]
     pub fn try_write(
         self: Pin<&mut Self>,
     ) -> Option<WriterGuard<'a, '_, T, O>> {
         unsafe { self.get_unchecked_mut().try_write_() }
     }
 
+    #[inline]
     pub fn try_upgradable_read(
         self: Pin<&mut Self>,
     ) -> Option<UpgradableReaderGuard<'a, '_, T, O>> {
@@ -300,12 +285,16 @@ where
     }
 
     #[inline]
-    pub fn read_async(self: Pin<&mut Self>) -> ReadAsync<'a, '_, T, O> {
+    pub fn read_async(
+        self: Pin<&mut Self>,
+    ) -> ReadAsync<'a, '_, T, O> {
         ReadAsync::new(self)
     }
 
     #[inline]
-    pub fn write_async(self: Pin<&mut Self>) -> WriteAsync<'a, '_, T, O> {
+    pub fn write_async(
+        self: Pin<&mut Self>,
+    ) -> WriteAsync<'a, '_, T, O> {
         WriteAsync::new(self)
     }
 
@@ -440,7 +429,7 @@ where
         let x = ctx.try_invalidate();
         assert!(
             x.is_succ(), 
-            "[RwLock::on_reader_guard_drop_] try_invalidate {ctx:?}",
+            "[Acquire::on_reader_guard_drop_] try_invalidate {ctx:?}",
         );
         loop {
             // A reader slot may be detached by other reader once invalidated.
@@ -490,18 +479,18 @@ where
         let x = ctx.try_invalidate();
         assert!(
             x.is_succ(),
-            "[RwLock::on_writer_guard_drop_] try_invalidate {ctx:?}",
+            "[Acquire::on_writer_guard_drop_] try_invalidate {ctx:?}",
         );
         if let Option::Some(q) = slot.attached_list() {
             let mutex = q.mutex();
             let mut g = mutex.acquire().wait();
             let opt_head = (*g).as_mut().pop_head();
             let Option::Some(head) = opt_head else {
-                unreachable!("[RwLock::on_writer_guard_drop_]")
+                unreachable!("[Acquire::on_writer_guard_drop_]")
             };
             assert!(
                 ptr::eq(head.deref(), slot.deref()),
-                "[RwLock::on_writer_guard_drop_] head eq",
+                "[Acquire::on_writer_guard_drop_] head eq",
             );
             RwLock::<T, O>::wake_next_((*g).as_mut());
         } else {
@@ -526,18 +515,18 @@ where
         let x = ctx.try_invalidate();
         assert!(
             x.is_succ(),
-            "[RwLock::on_upgradable_guard_drop_] try_invalidate {ctx:?}",
+            "[Acquire::on_upgradable_guard_drop_] try_invalidate {ctx:?}",
         );
         if let Option::Some(q) = slot.attached_list() {
             let mutex = q.mutex();
             let mut g = mutex.acquire().wait();
             let opt_head = (*g).as_mut().pop_head();
             let Option::Some(head) = opt_head else {
-                unreachable!("[RwLock::on_upgradable_guard_drop_]")
+                unreachable!("[Acquire::on_upgradable_guard_drop_]")
             };
             assert!(
                 ptr::eq(head.deref(), slot.deref()),
-                "[RwLock::on_upgradable_guard_drop_] head eq",
+                "[Acquire::on_upgradable_guard_drop_] head eq",
             );
             RwLock::<T, O>::wake_next_((*g).as_mut());
         } else {
@@ -562,15 +551,51 @@ where
         }
     }
 
+    /// Update the context within the instance of `Acquire`, changing from
+    /// writer to reader.
     pub(super) fn downgrade_writer_to_reader_(self: Pin<&mut Self>) {
         let mut acq = unsafe {
             NonNull::new_unchecked(self.get_unchecked_mut())
         };
         let mut acq_pin = unsafe { Pin::new_unchecked(acq.as_mut()) };
         let slot = acq_pin.as_mut().slot_pinned_();
-        if slot.attached_list().is_some() {
+        if let Option::Some(list) = slot.attached_list() {
+            debug_assert!({
+                let mutex = list.mutex();
+                let mut g = mutex.acquire().wait();
+                let head = (*g).as_mut().head_mut();
+                let head_slot = head.pinned_slot().unwrap();
+                ptr::eq(head_slot.get_ref(), slot.as_ref().get_ref())
+            });
             let head_cx = slot.data();
             let r = head_cx.try_downgrade_exclusive_to_readonly();
+            debug_assert!(r);
+        } else {
+            let mutex = unsafe { acq.as_ref().rwlock().queue().mutex() };
+            let mut g = mutex.acquire().wait();
+            let r = (*g).as_mut().push_head(slot);
+            debug_assert!(r.is_ok());
+            let acq_pin = unsafe { Pin::new_unchecked(acq.as_mut()) };
+            acq_pin.on_writer_guard_drop_()
+        };
+    }
+
+    pub(super) fn downgrade_writer_to_upgradable_(self: Pin<&mut Self>) {
+        let mut acq = unsafe {
+            NonNull::new_unchecked(self.get_unchecked_mut())
+        };
+        let mut acq_pin = unsafe { Pin::new_unchecked(acq.as_mut()) };
+        let slot = acq_pin.as_mut().slot_pinned_();
+        if let Option::Some(list) = slot.attached_list() {
+            debug_assert!({
+                let mutex = list.mutex();
+                let mut g = mutex.acquire().wait();
+                let head = (*g).as_mut().head_mut();
+                let head_slot = head.pinned_slot().unwrap();
+                ptr::eq(head_slot.get_ref(), slot.as_ref().get_ref())
+            });
+            let head_cx = slot.data();
+            let r = head_cx.try_downgrade_exclusive_to_upgradable();
             debug_assert!(r);
         } else {
             let mutex = unsafe { acq.as_ref().rwlock().queue().mutex() };
