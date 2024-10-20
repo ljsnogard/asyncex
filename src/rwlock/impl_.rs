@@ -21,10 +21,10 @@ use mm_ptr::x_deps::{
 };
 
 use super::{
-    contexts_::{CtxType, Message, WaitCtx, WakeList, WakeSlot},
+    contexts_::{CtxType, Message, WaitCtx, WakeList, WakeListGuard, WakeSlot},
     reader_::{ReadAsync, ReaderGuard},
-    writer_::{WriteAsync, WriterGuard},
     upgrade_::{UpgradableReadAsync, UpgradableReaderGuard},
+    writer_::{WriteAsync, WriterGuard},
 };
 
 #[repr(C)]
@@ -423,14 +423,37 @@ where
         }
     }
 
-    pub(super) fn on_reader_guard_drop_(mut self: Pin<&mut Self>) {
-        let mut slot = self.as_mut().slot_pinned_();
-        let ctx = slot.as_mut().data_pinned();
+    pub(super) fn try_downgrade_exclusive_to_readonly_(
+        &self,
+    ) -> CmpxchResult<RwStVal> {
+        let expect = |s|
+            RwLockState::<O>::expect_writer_acquired(s) &&
+            RwLockState::<O>::expect_inc_reader_count_valid(s) &&
+            RwLockState::<O>::expect_upgrade_inactive(s) &&
+            RwLockState::<O>::expect_queue_empty(s);
+        let desire = |s| {
+            let s1 = RwLockState::<O>::desire_writer_not_acquired(s);
+            RwLockState::<O>::desire_reader_count_incr(s1)
+        };
+        self.rwlock().state().try_spin_compare_exchange_weak(expect, desire)
+    }
+
+    #[inline]
+    pub(super) fn try_init_slot_ctx_(&self, ctx_type: CtxType) -> bool {
+        self.slot_().data().try_init_context_type(ctx_type)
+    }
+
+    pub(super) fn invalidate_slot_ctx_(slot: &WakeSlot<O>) {
+        let ctx = slot.data();
         let x = ctx.try_invalidate();
-        assert!(
-            x.is_succ(), 
-            "[Acquire::on_reader_guard_drop_] try_invalidate {ctx:?}",
-        );
+        assert!(x.is_succ(), "[Acquire::invalidate_slot_ctx_] {ctx:?}");
+    }
+
+    pub(super) fn on_reader_guard_drop_(mut self: Pin<&mut Self>) {
+        let slot = self.as_mut().slot_pinned_();
+        if slot.attached_list().is_some() {
+            Self::invalidate_slot_ctx_(slot.deref());
+        }
         loop {
             // A reader slot may be detached by other reader once invalidated.
             // So we need to keep watching if current slot is already detached.
@@ -473,39 +496,62 @@ where
         RwLock::<T, O>::wake_next_((*g).as_mut());
     }
 
+    pub(super) fn on_writer_guard_drop_with_list_guard_<'g>(
+        mut self: Pin<&mut Self>,
+        g: &mut WakeListGuard<'a, 'g, O>,
+    ) {
+        let slot = self.as_mut().slot_pinned_();
+        let q_pin = g.deref_mut();
+        let front = q_pin.as_mut().head_mut();
+        if let Option::Some(head) = front.pinned_slot() {
+            if ptr::eq(slot.deref(), head.deref()) {
+                #[cfg(test)]
+                log::warn!("[Acquire::on_writer_guard_drop_with_list_guard_] not head");
+                return
+            }
+            let head_ctx_type = head.data().context_type();
+            if !matches!(head_ctx_type, CtxType::Exclusive) {
+                return;
+            }
+        } else {
+            #[cfg(test)]
+            log::warn!("[Acquire::on_writer_guard_drop_with_list_guard_] empty head.");
+            return;
+        }
+        if q_pin.as_mut().pop_head().is_none() {
+            unreachable!("[Acquire::on_writer_guard_drop_attached_] pop head failed")
+        };
+        RwLock::<T, O>::wake_next_((*g).as_mut());
+        Self::invalidate_slot_ctx_(slot.deref());
+    }
+
     pub(super) fn on_writer_guard_drop_(mut self: Pin<&mut Self>) {
-        let mut slot = self.as_mut().slot_pinned_();
-        let ctx = slot.as_mut().data_pinned();
-        let x = ctx.try_invalidate();
-        assert!(
-            x.is_succ(),
-            "[Acquire::on_writer_guard_drop_] try_invalidate {ctx:?}",
-        );
+        let mut acq_ptr = unsafe {
+            NonNull::new_unchecked(self.as_mut().get_unchecked_mut())
+        };
+        let slot = self.as_mut().slot_pinned_();
         if let Option::Some(q) = slot.attached_list() {
             let mutex = q.mutex();
             let mut g = mutex.acquire().wait();
-            let opt_head = (*g).as_mut().pop_head();
-            let Option::Some(head) = opt_head else {
-                unreachable!("[Acquire::on_writer_guard_drop_]")
+
+            let acq_pin = unsafe {
+                Pin::new_unchecked(acq_ptr.as_mut())
             };
-            assert!(
-                ptr::eq(head.deref(), slot.deref()),
-                "[Acquire::on_writer_guard_drop_] head eq",
-            );
-            RwLock::<T, O>::wake_next_((*g).as_mut());
+            acq_pin.on_writer_guard_drop_with_list_guard_(&mut g);
         } else {
             // Deal with the case that the slot is not enqueued.
             let expect = RwLockState::<O>::expect_writer_acquired;
             let desire = RwLockState::<O>::desire_writer_not_acquired;
-            let r = self
-                .rwlock()
+            let acq_pin = self.as_ref();
+            let rwlock = acq_pin.get_ref().rwlock();
+            let r = rwlock
                 .state()
                 .try_spin_compare_exchange_weak(expect, desire);
             debug_assert!(r.is_succ());
 
-            let mutex = self.rwlock().queue().mutex();
+            let mutex = rwlock.queue().mutex();
             let mut g = mutex.acquire().wait();
-            RwLock::<T, O>::wake_next_((*g).as_mut());
+            RwLock::<T, O>::wake_next_((*g).as_mut()); 
         }
     }
 
@@ -575,8 +621,10 @@ where
             let mut g = mutex.acquire().wait();
             let r = (*g).as_mut().push_head(slot);
             debug_assert!(r.is_ok());
-            let acq_pin = unsafe { Pin::new_unchecked(acq.as_mut()) };
-            acq_pin.on_writer_guard_drop_()
+            let mut acq_pin = unsafe { Pin::new_unchecked(acq.as_mut()) };
+            let r = acq_pin.as_mut().try_downgrade_exclusive_to_readonly_();
+            assert!(r.is_succ());
+            acq_pin.on_writer_guard_drop_with_list_guard_(&mut g)
         };
     }
 
@@ -598,12 +646,28 @@ where
             let r = head_cx.try_downgrade_exclusive_to_upgradable();
             debug_assert!(r);
         } else {
-            let mutex = unsafe { acq.as_ref().rwlock().queue().mutex() };
+            let acq_pin = unsafe { Pin::new_unchecked(acq.as_mut()) };
+            let rwlock =  unsafe { acq.as_ref().rwlock() };
+            let mutex = rwlock.queue().mutex();
             let mut g = mutex.acquire().wait();
             let r = (*g).as_mut().push_head(slot);
             debug_assert!(r.is_ok());
-            let acq_pin = unsafe { Pin::new_unchecked(acq.as_mut()) };
-            acq_pin.on_writer_guard_drop_()
+            acq_pin.on_writer_guard_drop_with_list_guard_(&mut g);
+
+            let expect = |_| true;
+            let desire = |s| {
+                let s1 = RwLockState::<O>::desire_writer_not_acquired(s);
+                let s2 = RwLockState::<O>::desire_queue_not_empty(s1);
+                RwLockState::<O>::desire_upgrade_inactive(s2)
+            };
+            let r = rwlock
+                .state()
+                .try_spin_compare_exchange_weak(expect, desire);
+            if !r.is_succ() {
+                let v = r.into_inner();
+                #[cfg(test)]
+                log::warn!("[Acquire::downgrade_writer_to_upgradable_] {v:x}");
+            }
         };
     }
 }

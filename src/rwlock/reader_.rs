@@ -40,7 +40,8 @@ where
     pub(super) fn new(acquire: Pin<&'g mut Acquire<'a, T, O>>) -> Self {
         #[cfg(test)]
         unsafe {
-            let a = acquire.as_ref().get_ref() as *const _ as *mut Acquire<'a, T, O>;
+            let a = acquire.as_ref().get_ref()
+                as *const _ as *mut Acquire<'a, T, O>;
             let s = (*a).slot_().data();
             log::trace!("[ReaderGuard::new] acq({a:?}) WaitCtx({s:p})");
         }
@@ -213,8 +214,8 @@ where
     async fn read_async_(self: Pin<&mut Self>) -> <Self as Future>::Output {
         let this = self.project();
         if true {
-            let slot = this.acquire_.slot_();
-            let init = slot.data().try_init_context_type(CtxType::ReadOnly);
+            let acq_ref = this.acquire_.as_ref();
+            let init = acq_ref.try_init_slot_ctx_(CtxType::ReadOnly);
             assert!(init);
         }
         let mut acquire = unsafe {

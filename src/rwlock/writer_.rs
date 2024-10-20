@@ -67,6 +67,7 @@ where
         }
     }
 
+    #[allow(unused)]
     fn upgrade_pinned_(
         &mut self,
     ) -> Option<Pin<&mut Upgrade<'a, 'g, T, O>>> {

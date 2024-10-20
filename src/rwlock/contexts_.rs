@@ -5,7 +5,10 @@
 };
 
 use atomex::{CmpxchResult, StrictOrderings, TrAtomicFlags, TrCmpxchOrderings};
-use pincol::{linked_list::{PinnedList, PinnedSlot}, x_deps::atomex};
+use pincol::{
+    linked_list::{PinnedList, PinnedListGuard, PinnedSlot},
+    x_deps::atomex,
+};
 
 use crate::channel::oneshot::*;
 
@@ -65,6 +68,7 @@ impl fmt::Display for CtxType {
 pub(super) type Channel<O> = Oneshot<Message, O>;
 pub(super) type WakeSlot<O> = PinnedSlot<WaitCtx<O>, O>;
 pub(super) type WakeList<O> = PinnedList<WaitCtx<O>, O>;
+pub(super) type WakeListGuard<'a, 'g, O> = PinnedListGuard<'a, 'g, WaitCtx<O>, O>;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Message {
